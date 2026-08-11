@@ -1,39 +1,31 @@
 """Streamlit prototype – Prediksi Status Pinjaman.
 
+Versi ini memuat model final yang SUDAH DILATIH (model.pkl) — berisi
+KEDUA model (Random Forest & XGBoost) beserta metrik lengkap hasil
+Nested CV — alih-alih menjalankan Nested CV + GridSearchCV setiap kali
+aplikasi dibuka. Startup jadi hampir instan karena tidak ada training
+sama sekali di runtime.
+
 Staf kredit memasukkan data nasabah, lalu sistem menampilkan:
-- Prediksi status pinjaman (Lunas / Gagal Bayar)
+- Prediksi status pinjaman (Lunas / Gagal Bayar) dari salah satu atau
+  kedua model sekaligus
 - Probabilitas gagal bayar
-- F2-Score model & estimasi kerugian finansial
+- Metrik lengkap (Accuracy, Precision, Recall, F1, F2, AUC, FP/FN) &
+  estimasi kerugian finansial
 """
 
-import warnings, pickle, os
+import warnings
 from pathlib import Path
-from collections import Counter
 
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, fbeta_score, roc_auc_score, confusion_matrix,
-)
-from sklearn.model_selection import StratifiedKFold, GridSearchCV
-from sklearn.preprocessing import OneHotEncoder
-from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
 
 # ── Constants ────────────────────────────────────────────────────────
-DATA_PATH = Path("data/loan_data.csv")
-MODEL_CACHE = Path("trained_model.pkl")
-TARGET_COL = "status_pinjaman"
-DROP_COLS = ["id_pelanggan", "gagal_bayar_tercatat"]
-RANDOM_STATE = 42
-INNER_SPLITS = 3
+MODEL_PATH = Path("model.pkl")
 AVG_LOAN_AMOUNT = 33_042
 RECOVERY_RATE = 0.30
 PROFIT_MARGIN = 0.05
@@ -45,251 +37,55 @@ TUJUAN_PINJAMAN_OPTIONS = [
     "Pendidikan", "Pribadi", "Medis",
 ]
 
+# Rentang hyperparameter yang diuji di notebook (informasional saja —
+# GridSearchCV sudah dijalankan sekali di notebook, tidak diulang di app)
 RF_PARAM_GRID = {
-    "model__n_estimators": [100, 200],
-    "model__max_depth": [10, 15],
-    "model__min_samples_split": [2, 5],
-    "model__min_samples_leaf": [1, 2],
+    "n_estimators": [100, 200],
+    "max_depth": [10, 15],
+    "min_samples_split": [2, 5],
+    "min_samples_leaf": [1, 2],
 }
 XGB_PARAM_GRID = {
-    "model__n_estimators": [100, 200],
-    "model__max_depth": [4, 6],
-    "model__learning_rate": [0.05, 0.1],
-    "model__subsample": [0.8, 1.0],
-    "model__colsample_bytree": [0.8],
+    "n_estimators": [100, 200],
+    "max_depth": [4, 6],
+    "learning_rate": [0.05, 0.1],
+    "subsample": [0.8, 1.0],
+    "colsample_bytree": [0.8],
 }
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# ── Load model (sekali, di-cache) ───────────────────────────────────
 
-@st.cache_data(show_spinner=False)
-def load_data():
-    df = pd.read_csv(DATA_PATH)
-    df = df.drop(columns=DROP_COLS)
-    X = df.drop(columns=[TARGET_COL])
-    y = df[TARGET_COL]
-    return X, y
-
-
-def preprocess_ohe(X: pd.DataFrame):
-    """Full-dataset OHE for training (impute → one-hot)."""
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-    Xp = X.copy()
-    num_imp = SimpleImputer(strategy="median")
-    Xp[num_cols] = num_imp.fit_transform(Xp[num_cols])
-    cat_imp = SimpleImputer(strategy="most_frequent")
-    Xp[cat_cols] = cat_imp.fit_transform(Xp[cat_cols])
-    Xp = pd.get_dummies(Xp, columns=cat_cols, drop_first=False)
-    return Xp, num_imp, cat_imp, num_cols, cat_cols
-
-
-@st.cache_resource(show_spinner="Melatih model (sekali saja)…")
-def train_models():
-    X_raw, y = load_data()
-    metrics = compute_cv_metrics(X_raw, y)
-    rf_params = metrics["rf"]["params_repr"]
-    xgb_params = metrics["xgb"]["params_repr"]
-
-    X_proc, num_imp, cat_imp, num_cols, cat_cols = preprocess_ohe(X_raw)
-    smote = SMOTE(random_state=RANDOM_STATE)
-    X_sm, y_sm = smote.fit_resample(X_proc, y)
-
-    rf = RandomForestClassifier(**rf_params)
-    rf.fit(X_sm, y_sm)
-
-    xgb = XGBClassifier(**xgb_params)
-    xgb.fit(X_sm, y_sm)
-
-    return {
-        "rf": rf, "xgb": xgb,
-        "num_imp": num_imp, "cat_imp": cat_imp,
-        "num_cols": num_cols, "cat_cols": cat_cols,
-        "feature_cols": X_proc.columns.tolist(),
-        "metrics": metrics,
-    }
-
-
-def _representative_params(best_params_per_fold: list[dict], extra_params: dict) -> dict:
-    if not best_params_per_fold:
-        return extra_params.copy()
-    params_repr = {}
-    for key in best_params_per_fold[0]:
-        vals = [p[key] for p in best_params_per_fold]
-        params_repr[key] = Counter(vals).most_common(1)[0][0]
-    params_repr.update(extra_params)
-    return params_repr
-
-
-def _nested_cv_for_model(
-    X_raw: pd.DataFrame,
-    y: pd.Series,
-    model_name: str,
-    param_grid: dict,
-    n_splits: int = 10,
-    inner_splits: int = INNER_SPLITS,
-) -> dict:
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
-    inner_cv = StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=RANDOM_STATE)
-
-    num_cols = X_raw.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X_raw.select_dtypes(exclude=[np.number]).columns.tolist()
-
-    metrics_rows = []
-    total_fp = 0
-    total_fn = 0
-    best_params_per_fold = []
-
-    if model_name == "rf":
-        base_model = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=1)
-        extra_params = {"random_state": RANDOM_STATE, "n_jobs": -1}
-    else:
-        base_model = XGBClassifier(
-            random_state=RANDOM_STATE,
-            n_jobs=1,
-            use_label_encoder=False,
-            eval_metric="logloss",
-            verbosity=0,
-        )
-        extra_params = {
-            "use_label_encoder": False,
-            "eval_metric": "logloss",
-            "random_state": RANDOM_STATE,
-            "n_jobs": -1,
-            "verbosity": 0,
-        }
-
-    for train_idx, val_idx in skf.split(X_raw, y):
-        X_train_raw = X_raw.iloc[train_idx].copy()
-        X_val_raw = X_raw.iloc[val_idx].copy()
-        y_train_fold = y.iloc[train_idx]
-        y_val_fold = y.iloc[val_idx]
-
-        # Imputation per fold
-        if num_cols:
-            num_imputer = SimpleImputer(strategy="median")
-            X_train_raw[num_cols] = num_imputer.fit_transform(X_train_raw[num_cols])
-            X_val_raw[num_cols] = num_imputer.transform(X_val_raw[num_cols])
-        if cat_cols:
-            cat_imputer = SimpleImputer(strategy="most_frequent")
-            X_train_raw[cat_cols] = cat_imputer.fit_transform(X_train_raw[cat_cols])
-            X_val_raw[cat_cols] = cat_imputer.transform(X_val_raw[cat_cols])
-
-        # OHE per fold (fit only on train)
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-        X_train_ohe = ohe.fit_transform(X_train_raw[cat_cols])
-        X_val_ohe = ohe.transform(X_val_raw[cat_cols])
-        ohe_names = ohe.get_feature_names_out(cat_cols)
-
-        X_train_fold = pd.concat(
-            [
-                X_train_raw[num_cols].reset_index(drop=True),
-                pd.DataFrame(X_train_ohe, columns=ohe_names),
-            ],
-            axis=1,
-        ).astype(float)
-        X_val_fold = pd.concat(
-            [
-                X_val_raw[num_cols].reset_index(drop=True),
-                pd.DataFrame(X_val_ohe, columns=ohe_names),
-            ],
-            axis=1,
-        ).astype(float)
-
-        pipeline_inner = Pipeline(
-            steps=[
-                ("smote", SMOTE(random_state=RANDOM_STATE)),
-                ("model", base_model),
-            ]
-        )
-        grid = GridSearchCV(
-            pipeline_inner,
-            param_grid,
-            scoring="f1",
-            cv=inner_cv,
-            n_jobs=-1,
-        )
-        grid.fit(X_train_fold, y_train_fold)
-
-        best_p = {k.replace("model__", ""): v for k, v in grid.best_params_.items()}
-        best_params_per_fold.append(best_p)
-
-        smote_fold = SMOTE(random_state=RANDOM_STATE)
-        X_train_smote, y_train_smote = smote_fold.fit_resample(X_train_fold, y_train_fold)
-
-        if model_name == "rf":
-            model = RandomForestClassifier(**best_p, random_state=RANDOM_STATE, n_jobs=-1)
-        else:
-            model = XGBClassifier(
-                **best_p,
-                use_label_encoder=False,
-                eval_metric="logloss",
-                random_state=RANDOM_STATE,
-                n_jobs=-1,
-                verbosity=0,
-            )
-        model.fit(X_train_smote, y_train_smote)
-
-        y_pred = model.predict(X_val_fold)
-        y_prob = model.predict_proba(X_val_fold)[:, 1]
-
-        acc = accuracy_score(y_val_fold, y_pred)
-        prec = precision_score(y_val_fold, y_pred)
-        rec = recall_score(y_val_fold, y_pred)
-        f1 = f1_score(y_val_fold, y_pred)
-        f2 = fbeta_score(y_val_fold, y_pred, beta=2, zero_division=0)
-        auc = roc_auc_score(y_val_fold, y_prob)
-
-        cm = confusion_matrix(y_val_fold, y_pred)
-        tn, fp, fn, tp = cm.ravel()
-        total_fp += fp
-        total_fn += fn
-
-        metrics_rows.append({
-            "accuracy": acc,
-            "precision": prec,
-            "recall": rec,
-            "f1": f1,
-            "f2": f2,
-            "auc": auc,
-        })
-
-    metrics_df = pd.DataFrame(metrics_rows)
-    summary = {
-        "mean": metrics_df[["accuracy", "precision", "recall", "f1", "f2", "auc"]].mean(),
-        "std": metrics_df[["accuracy", "precision", "recall", "f1", "f2", "auc"]].std(),
-        "total_fn": int(total_fn),
-        "total_fp": int(total_fp),
-        "params_repr": _representative_params(best_params_per_fold, extra_params),
-    }
-    return summary
-
-
-def compute_cv_metrics(X_raw, y, n_splits=10, inner_splits=INNER_SPLITS):
-    return {
-        "rf": _nested_cv_for_model(
-            X_raw, y, model_name="rf", param_grid=RF_PARAM_GRID,
-            n_splits=n_splits, inner_splits=inner_splits,
-        ),
-        "xgb": _nested_cv_for_model(
-            X_raw, y, model_name="xgb", param_grid=XGB_PARAM_GRID,
-            n_splits=n_splits, inner_splits=inner_splits,
-        ),
-    }
+@st.cache_resource(show_spinner="Memuat model...")
+def load_bundle():
+    if not MODEL_PATH.exists():
+        return None
+    return joblib.load(MODEL_PATH)
 
 
 def prepare_single_input(row: dict, bundle: dict) -> pd.DataFrame:
-    """Transform a single input row into the same feature space as training."""
+    """Transform satu baris input mentah ke feature space yang sama
+    dengan saat training, memakai imputer & encoder yang tersimpan
+    di model.pkl (BUKAN di-fit ulang)."""
     df = pd.DataFrame([row])
-    num_cols = bundle["num_cols"]
-    cat_cols = bundle["cat_cols"]
-    df[num_cols] = bundle["num_imp"].transform(df[num_cols])
-    df[cat_cols] = bundle["cat_imp"].transform(df[cat_cols])
-    df = pd.get_dummies(df, columns=cat_cols, drop_first=False)
-    for c in bundle["feature_cols"]:
-        if c not in df.columns:
-            df[c] = 0.0
-    df = df[bundle["feature_cols"]].astype(float)
-    return df
+
+    for col, val in bundle["num_impute_values"].items():
+        if col in df.columns:
+            df[col] = df[col].fillna(val)
+    for col, val in bundle["cat_impute_values"].items():
+        if col in df.columns:
+            df[col] = df[col].fillna(val)
+
+    ohe = bundle["ohe_encoder"]
+    ohe_arr = ohe.transform(df[bundle["cat_cols"]])
+    ohe_cols = ohe.get_feature_names_out(bundle["cat_cols"]).tolist()
+
+    df_final = pd.concat([
+        df[bundle["num_cols"]].reset_index(drop=True),
+        pd.DataFrame(ohe_arr, columns=ohe_cols),
+    ], axis=1)
+
+    df_final = df_final.reindex(columns=bundle["feature_names"], fill_value=0)
+    return df_final.astype(float)
 
 
 # ── Page config ──────────────────────────────────────────────────────
@@ -305,7 +101,6 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 * { font-family: 'Inter', sans-serif; }
 
-/* Force background and global text color */
 .stApp { background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%); color: #f1f5f9 !important; }
 .main { background: transparent; }
 [data-testid="stSidebar"] {
@@ -313,26 +108,23 @@ st.markdown("""
 }
 [data-testid="stSidebar"] * { color: #e0e0e0 !important; }
 
-/* Force text colors for tables, markdown, and paragraphs */
 .stMarkdown *, p, span { color: #e0e0e0 !important; }
 h1, h2, h3, h4, h5, h6 { color: #f8fafc !important; }
 
-/* Table styling for dark theme */
 table { width: 100%; border-collapse: collapse; }
-table th, table td { 
-    border: 1px solid rgba(255,255,255,0.1) !important; 
-    background: rgba(0,0,0,0.2) !important; 
-    color: #e0e0e0 !important; 
+table th, table td {
+    border: 1px solid rgba(255,255,255,0.1) !important;
+    background: rgba(0,0,0,0.2) !important;
+    color: #e0e0e0 !important;
     padding: 10px;
 }
-thead tr th { 
-    background-color: rgba(255,255,255,0.1) !important; 
-    color: #f8fafc !important; 
-    font-weight: 600; 
+thead tr th {
+    background-color: rgba(255,255,255,0.1) !important;
+    color: #f8fafc !important;
+    font-weight: 600;
 }
 tbody tr:hover td { background-color: rgba(255,255,255,0.05) !important; }
 
-/* Custom Cards */
 .pred-card {
     border-radius: 16px; padding: 28px; text-align: center;
     box-shadow: 0 8px 32px rgba(0,0,0,.35);
@@ -357,6 +149,20 @@ tbody tr:hover td { background-color: rgba(255,255,255,0.05) !important; }
 </style>
 """, unsafe_allow_html=True)
 
+
+# ── Load model bundle di awal ───────────────────────────────────────
+bundle = load_bundle()
+
+if bundle is None:
+    st.error(
+        f"❌ File **{MODEL_PATH}** tidak ditemukan di direktori aplikasi. "
+        "Jalankan cell 'Menyimpan Model Final' di notebook terlebih dahulu, "
+        "lalu letakkan `model.pkl` di folder yang sama dengan `app.py` ini."
+    )
+    st.stop()
+
+AVAILABLE_MODELS = list(bundle["models"].keys())  # ["Random Forest", "XGBoost"]
+BEST_MODEL_NAME = bundle["best_model_name"]
 
 # ── Sidebar – input form ─────────────────────────────────────────────
 st.sidebar.markdown("## 📋 Data Nasabah")
@@ -388,12 +194,16 @@ st.sidebar.markdown(f"**Rasio Hutang / Pendapatan:** `{rasio_hutang:.3f}`")
 st.sidebar.markdown(f"**Rasio Pinjaman / Pendapatan:** `{rasio_pinjaman:.3f}`")
 st.sidebar.markdown(f"**Rasio Pembayaran / Pendapatan:** `{rasio_pembayaran:.3f}`")
 
-model_choice = st.sidebar.radio("Model", ["Random Forest", "XGBoost", "Bandingkan Keduanya"])
+model_choice = st.sidebar.radio(
+    "Model",
+    AVAILABLE_MODELS + ["Bandingkan Keduanya"],
+    index=len(AVAILABLE_MODELS),  # default: Bandingkan Keduanya
+)
 predict_btn = st.sidebar.button("🔍 Prediksi Sekarang", use_container_width=True)
 
 # ── Main content ─────────────────────────────────────────────────────
 st.markdown("# 🏦 Sistem Prediksi Status Pinjaman")
-st.markdown("##### Prototype untuk staf kredit — masukkan data di sidebar lalu klik **Prediksi**")
+st.markdown(f"##### Prototype untuk staf kredit — model dimuat langsung dari `model.pkl` (🏆 terbaik: **{BEST_MODEL_NAME}**)")
 
 # Prepare input
 input_row = {
@@ -417,16 +227,12 @@ input_row = {
 }
 
 if predict_btn:
-    bundle = train_models()
     X_input = prepare_single_input(input_row, bundle)
 
-    models_to_run = []
-    if model_choice == "Random Forest":
-        models_to_run = [("Random Forest", bundle["rf"])]
-    elif model_choice == "XGBoost":
-        models_to_run = [("XGBoost", bundle["xgb"])]
+    if model_choice == "Bandingkan Keduanya":
+        models_to_run = [(name, bundle["models"][name]) for name in AVAILABLE_MODELS]
     else:
-        models_to_run = [("Random Forest", bundle["rf"]), ("XGBoost", bundle["xgb"])]
+        models_to_run = [(model_choice, bundle["models"][model_choice])]
 
     cols = st.columns(len(models_to_run))
     for col, (mname, mdl) in zip(cols, models_to_run):
@@ -450,30 +256,29 @@ if predict_btn:
             </div>
             """, unsafe_allow_html=True)
 
-            # Financial loss estimate for this individual
             loss = jumlah_pinjaman * (1 - RECOVERY_RATE) * prob_gagal
             st.markdown(f"""
             <div class="metric-card" style="margin-top:16px">
                 <h3>💰 Estimasi Potensi Kerugian</h3>
                 <p> {loss:,.0f}</p>
-                <span style="font-size:12px;color:#94a3b8">= pinjaman × (1 − recovery) × P(gagal bayar)</span>
+                <!-- <span style="font-size:12px;color:#94a3b8">= pinjaman × (1 − recovery) × P(gagal bayar)</span> -->
             </div>
             """, unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── Model performance metrics ─────────────────────────────────
-    st.markdown("## 📊 Performa Model (10-Fold CV)")
-    metrics = bundle["metrics"]
-    for mkey, mname in [("rf", "Random Forest"), ("xgb", "XGBoost")]:
-        m = metrics[mkey]
+    # ── Model performance metrics (dari hasil Nested CV di notebook) ─
+    st.markdown("## 📊 Performa Model")
+    for mname in AVAILABLE_MODELS:
+        m = bundle["metrics"][mname]
+        star = " 🏆" if mname == BEST_MODEL_NAME else ""
+        st.markdown(f"#### {mname}{star}")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        st.markdown(f"#### {mname}")
         for col_w, (label, key) in zip(
             [c1, c2, c3, c4, c5, c6],
             [("Accuracy", "accuracy"), ("Precision", "precision"),
-             ("Recall", "recall"), ("F1-Score", "f1"),
-             ("F2-Score", "f2"), ("AUC", "auc")],
+             ("Recall", "recall"), ("F1-Score", "f1_score"),
+             ("F2-Score", "f2_score"), ("AUC", "auc")],
         ):
             col_w.markdown(f"""
             <div class="metric-card">
@@ -483,42 +288,35 @@ if predict_btn:
             </div>
             """, unsafe_allow_html=True)
 
-        # Financial loss (FP = default loss, FN = missed profit)
         fp_loss = m["total_fp"] * AVG_LOAN_AMOUNT * (1 - RECOVERY_RATE)
         fn_cost = m["total_fn"] * AVG_LOAN_AMOUNT * PROFIT_MARGIN
         st.markdown(f"""
+        <!--
         <div class="metric-card" style="margin:12px 0 24px 0">
-            <h3>💸 Estimasi Kerugian Finansial (seluruh fold)</h3>
+            <h3>💸 Estimasi Kerugian Finansial </h3>
             <p> {fp_loss + fn_cost:,.0f}</p>
             <span style="font-size:12px;color:#94a3b8">
                 FP ({m['total_fp']:,}×) = {fp_loss:,.0f} &nbsp;|&nbsp;
                 FN ({m['total_fn']:,}×) = {fn_cost:,.0f}
             </span>
         </div>
+        -->
         """, unsafe_allow_html=True)
 
-    # ── Hyperparameter search table ───────────────────────────────
-    st.markdown("## 🔧 Rentang Hyperparameter yang Diuji")
+    # ── Hyperparameter model final ──────────────────────────────────
+    st.markdown("## 🔧 Hyperparameter Model Final")
     col_rf, col_xgb = st.columns(2)
-    with col_rf:
-        st.markdown("#### Random Forest")
-        rf_rows = [{"Hyperparameter": k.replace("model__", ""), "Rentang": str(v), "Opsi": len(v)}
-               for k, v in RF_PARAM_GRID.items()]
-        st.table(pd.DataFrame(rf_rows))
-        total_rf = 1
-        for v in RF_PARAM_GRID.values():
-            total_rf *= len(v)
-        st.caption(f"Total kombinasi: **{total_rf}** · Scoring: F1 · CV: Stratified {INNER_SPLITS}-Fold")
-
-    with col_xgb:
-        st.markdown("#### XGBoost")
-        xgb_rows = [{"Hyperparameter": k.replace("model__", ""), "Rentang": str(v), "Opsi": len(v)}
-                for k, v in XGB_PARAM_GRID.items()]
-        st.table(pd.DataFrame(xgb_rows))
-        total_xgb = 1
-        for v in XGB_PARAM_GRID.values():
-            total_xgb *= len(v)
-        st.caption(f"Total kombinasi: **{total_xgb}** · Scoring: F1 · CV: Stratified {INNER_SPLITS}-Fold")
+    for col_w, mname, grid in [(col_rf, "Random Forest", RF_PARAM_GRID), (col_xgb, "XGBoost", XGB_PARAM_GRID)]:
+        with col_w:
+            st.markdown(f"#### {mname}")
+            best_p = bundle["metrics"][mname]["params_repr"]
+            rows = [{"Hyperparameter": k, "Nilai Terpilih": v, "Rentang Diuji": str(grid.get(k, "—"))}
+                    for k, v in best_p.items() if k in grid]
+            st.table(pd.DataFrame(rows))
+            total = 1
+            for v in grid.values():
+                total *= len(v)
+            st.caption(f"Total kombinasi diuji: **{total}**")
 
 else:
     # Landing state
@@ -529,7 +327,7 @@ else:
     for col_w, icon, title, desc in [
         (c1, "🌲", "Random Forest", "Ensemble bagging dari banyak decision tree"),
         (c2, "🚀", "XGBoost", "Gradient boosting yang dioptimasi untuk kecepatan"),
-        (c3, "🔒", "Anti-Leakage", "SMOTE & encoding hanya pada training fold"),
+        (c3, "⚡", "Instan", "Kedua model sudah dilatih sebelumnya (model.pkl) — tidak ada training saat aplikasi dibuka"),
     ]:
         col_w.markdown(f"""
         <div class="metric-card">
