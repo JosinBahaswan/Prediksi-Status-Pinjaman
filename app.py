@@ -6,46 +6,36 @@ Nested CV — alih-alih menjalankan Nested CV + GridSearchCV setiap kali
 aplikasi dibuka. Startup jadi hampir instan karena tidak ada training
 sama sekali di runtime.
 
-Model yang disimpan berasal dari fold dengan F2-Score tertinggi
-dalam proses Nested CV (bukan fit ulang pada seluruh data).
-
 Staf kredit memasukkan data nasabah, lalu sistem menampilkan:
 - Prediksi status pinjaman (Lunas / Gagal Bayar) dari salah satu atau
   kedua model sekaligus
 - Probabilitas gagal bayar
-- SHAP waterfall plot lokal (penjelasan kenapa nasabah ditolak/disetujui)
-- Metrik lengkap (Accuracy, Precision, Recall, F1, F2, AUC)
+- Metrik lengkap (Accuracy, Precision, Recall, F1, F2, AUC, FP/FN) &
+  estimasi kerugian finansial
 """
 
 import warnings
 from pathlib import Path
 
 import joblib
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import shap
 import streamlit as st
 
 warnings.filterwarnings("ignore")
 
 # ── Constants ────────────────────────────────────────────────────────
 MODEL_PATH = Path("model.pkl")
+AVG_LOAN_AMOUNT = 33_042
+RECOVERY_RATE = 0.30
+PROFIT_MARGIN = 0.05
 
-STATUS_REKENING_OPTIONS = ["0-200_DM", "diatas_200_DM", "dibawah_0_DM", "tidak_ada"]
-RIWAYAT_KREDIT_OPTIONS = ["kritis/ada_kredit_lain", "lancar/tidak_ada_kredit", "lancar_hingga_kini", "pernah_telat", "semua_lancar_di_bank_ini"]
-TUJUAN_PINJAMAN_OPTIONS = ["alat_rumah_tangga", "bisnis", "lainnya", "liburan", "mobil_baru", "mobil_bekas", "pelatihan_ulang", "perabot/peralatan", "perbaikan", "radio/tv"]
-ASET_TABUNGAN_OPTIONS = ["100-500_DM", "500-1000_DM", "diatas_1000_DM", "dibawah_100_DM", "tidak_diketahui/tidak_ada"]
-LAMA_BEKERJA_OPTIONS = ["1-4_thn", "4-7_thn", "diatas_7_thn", "dibawah_1_thn", "menganggur"]
-RASIO_CICILAN_OPTIONS = ["20_sd_25_persen", "25_sd_35_persen", "diatas_35_persen", "dibawah_20_persen"]
-STATUS_PERSONAL_KELAMIN_OPTIONS = ["pria_cerai/pisah", "pria_menikah/duda", "wanita_lajang", "wanita_menikah_atau_pria_lajang"]
-LAMA_TINGGAL_OPTIONS = ["1-4_thn", "4-7_thn", "diatas_7_thn", "dibawah_1_thn"]
-KEPEMILIKAN_HARTA_OPTIONS = ["asuransi_jiwa/tabungan", "mobil/lainnya", "real_estate", "tidak_ada/tidak_diketahui"]
-CICILAN_LAIN_OPTIONS = ["bank", "tidak_ada", "toko"]
-PERUMAHAN_OPTIONS = ["gratis", "milik_sendiri", "sewa"]
-PEKERJAAN_OPTIONS = ["karyawan_ahli/pejabat", "manajer/wiraswasta", "menganggur/tidak_ahli_non-residen", "tidak_ahli_residen"]
+STATUS_PEKERJAAN_OPTIONS = ["Employed", "Self-Employed", "Student"]
+TIPE_PRODUK_OPTIONS = ["Kartu Kredit", "Pinjaman Pribadi", "Kredit Berjalan"]
+TUJUAN_PINJAMAN_OPTIONS = [
+    "Bisnis", "Renovasi Rumah", "Konsolidasi Hutang",
+    "Pendidikan", "Pribadi", "Medis",
+]
 
 # Rentang hyperparameter yang diuji di notebook (informasional saja —
 # GridSearchCV sudah dijalankan sekali di notebook, tidak diulang di app)
@@ -72,36 +62,20 @@ def load_bundle():
     return joblib.load(MODEL_PATH)
 
 
-def prepare_single_input(row: dict, bundle: dict, model_name: str) -> pd.DataFrame:
+def prepare_single_input(row: dict, bundle: dict) -> pd.DataFrame:
     """Transform satu baris input mentah ke feature space yang sama
     dengan saat training, memakai imputer & encoder yang tersimpan
-    di model.pkl (BUKAN di-fit ulang).
-
-    OHE encoder, impute values, dan feature_names bisa disimpan per-model
-    (dict keyed by model_name) atau sebagai nilai tunggal — keduanya didukung.
-    """
+    di model.pkl (BUKAN di-fit ulang)."""
     df = pd.DataFrame([row])
 
-    # Ambil impute values — bisa dict per-model atau langsung dict fitur
-    num_impute = bundle["num_impute_values"]
-    cat_impute = bundle["cat_impute_values"]
-    if isinstance(num_impute, dict) and model_name in num_impute:
-        num_impute = num_impute[model_name]
-    if isinstance(cat_impute, dict) and model_name in cat_impute:
-        cat_impute = cat_impute[model_name]
-
-    for col, val in num_impute.items():
+    for col, val in bundle["num_impute_values"].items():
         if col in df.columns:
             df[col] = df[col].fillna(val)
-    for col, val in cat_impute.items():
+    for col, val in bundle["cat_impute_values"].items():
         if col in df.columns:
             df[col] = df[col].fillna(val)
 
-    # Ambil OHE encoder — bisa dict per-model atau encoder tunggal
     ohe = bundle["ohe_encoder"]
-    if isinstance(ohe, dict):
-        ohe = ohe[model_name]
-
     ohe_arr = ohe.transform(df[bundle["cat_cols"]])
     ohe_cols = ohe.get_feature_names_out(bundle["cat_cols"]).tolist()
 
@@ -110,50 +84,8 @@ def prepare_single_input(row: dict, bundle: dict, model_name: str) -> pd.DataFra
         pd.DataFrame(ohe_arr, columns=ohe_cols),
     ], axis=1)
 
-    # Ambil feature_names — bisa dict per-model atau list tunggal
-    feat_names = bundle["feature_names"]
-    if isinstance(feat_names, dict):
-        feat_names = feat_names[model_name]
-
-    df_final = df_final.reindex(columns=feat_names, fill_value=0)
+    df_final = df_final.reindex(columns=bundle["feature_names"], fill_value=0)
     return df_final.astype(float)
-
-
-@st.cache_resource(show_spinner="Menyiapkan SHAP explainer...")
-def get_shap_explainer(_model, model_name: str):
-    """Buat TreeExplainer untuk model yang diberikan (di-cache per model_name)."""
-    return shap.TreeExplainer(_model)
-
-
-def plot_shap_waterfall(explainer, X_input: pd.DataFrame, model_name: str, pred: int):
-    """Buat SHAP waterfall plot untuk satu nasabah."""
-    shap_obj = explainer(X_input)
-
-    # RF mengembalikan Explanation 3D (samples, features, classes) → ambil kelas 1 (Lunas)
-    if len(shap_obj.shape) == 3:
-        shap_single = shap_obj[0, :, 1]
-    else:
-        shap_single = shap_obj[0]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    plt.sca(ax)
-    shap.waterfall_plot(shap_single, max_display=10, show=False)
-
-    label = "LUNAS" if pred == 1 else "GAGAL BAYAR"
-    ax.set_title(
-        f"SHAP — Alasan Prediksi '{label}' ({model_name})",
-        fontsize=12, fontweight="bold", pad=12,
-    )
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#1a1a2e")
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#ffffff22")
-    ax.tick_params(colors="#e0e0e0")
-    ax.xaxis.label.set_color("#e0e0e0")
-    ax.yaxis.label.set_color("#e0e0e0")
-    ax.title.set_color("#f8fafc")
-    plt.tight_layout()
-    return fig
 
 
 # ── Page config ──────────────────────────────────────────────────────
@@ -214,12 +146,6 @@ tbody tr:hover td { background-color: rgba(255,255,255,0.05) !important; }
 .metric-card h3 { color: #a78bfa !important; font-size: 14px; margin-bottom: 4px; }
 .metric-card p { color: #f1f5f9 !important; font-size: 26px; font-weight: 700; margin: 0; }
 .metric-card span { color: #94a3b8 !important; }
-
-.shap-section {
-    background: rgba(255,255,255,.04); border-radius: 12px;
-    padding: 12px 16px; margin-top: 16px;
-    border: 1px solid rgba(167,139,250,.25);
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -241,25 +167,33 @@ BEST_MODEL_NAME = bundle["best_model_name"]
 # ── Sidebar – input form ─────────────────────────────────────────────
 st.sidebar.markdown("## 📋 Data Nasabah")
 
-usia = st.sidebar.number_input("Usia", 18, 100, 35)
-durasi_pinjaman_bulan = st.sidebar.number_input("Durasi Pinjaman (bulan)", 1, 120, 24)
-jumlah_pinjaman = st.sidebar.number_input("Jumlah Pinjaman (DM)", 100, 100000, 2000, step=500)
+usia = st.sidebar.number_input("Usia", 18, 70, 35)
+status_pekerjaan = st.sidebar.selectbox("Status Pekerjaan", STATUS_PEKERJAAN_OPTIONS)
+lama_bekerja = st.sidebar.number_input("Lama Bekerja (tahun)", 0.0, 40.0, 5.0, step=0.5)
+pendapatan = st.sidebar.number_input("Pendapatan Tahunan ", 15_000, 250_000, 50_000, step=5000)
+skor_kredit = st.sidebar.number_input("Skor Kredit", 300, 850, 650)
+lama_riwayat = st.sidebar.number_input("Lama Riwayat Kredit (tahun)", 0.0, 30.0, 5.0, step=0.5)
+aset_tabungan = st.sidebar.number_input("Aset / Tabungan ", 0, 300_000, 3_000, step=500)
+hutang = st.sidebar.number_input("Hutang Saat Ini ", 0, 200_000, 10_000, step=1000)
 
 st.sidebar.markdown("---")
-status_rekening = st.sidebar.selectbox("Status Rekening", STATUS_REKENING_OPTIONS)
-riwayat_kredit = st.sidebar.selectbox("Riwayat Kredit", RIWAYAT_KREDIT_OPTIONS)
-tujuan_pinjaman = st.sidebar.selectbox("Tujuan Pinjaman", TUJUAN_PINJAMAN_OPTIONS)
-aset_tabungan = st.sidebar.selectbox("Aset Tabungan", ASET_TABUNGAN_OPTIONS)
-lama_bekerja = st.sidebar.selectbox("Lama Bekerja", LAMA_BEKERJA_OPTIONS)
-rasio_cicilan = st.sidebar.selectbox("Rasio Cicilan", RASIO_CICILAN_OPTIONS)
-status_personal_dan_kelamin = st.sidebar.selectbox("Status Personal & Kelamin", STATUS_PERSONAL_KELAMIN_OPTIONS)
-lama_tinggal = st.sidebar.selectbox("Lama Tinggal", LAMA_TINGGAL_OPTIONS)
-kepemilikan_harta = st.sidebar.selectbox("Kepemilikan Harta", KEPEMILIKAN_HARTA_OPTIONS)
-cicilan_lain = st.sidebar.selectbox("Cicilan Lain", CICILAN_LAIN_OPTIONS)
-perumahan = st.sidebar.selectbox("Perumahan", PERUMAHAN_OPTIONS)
-pekerjaan = st.sidebar.selectbox("Pekerjaan", PEKERJAAN_OPTIONS)
+tunggakan = st.sidebar.number_input("Tunggakan 2 Tahun Terakhir", 0, 10, 0)
+catatan_negatif = st.sidebar.number_input("Catatan Negatif", 0, 5, 0)
+tipe_produk = st.sidebar.selectbox("Tipe Produk", TIPE_PRODUK_OPTIONS)
+tujuan = st.sidebar.selectbox("Tujuan Pinjaman", TUJUAN_PINJAMAN_OPTIONS)
+jumlah_pinjaman = st.sidebar.number_input("Jumlah Pinjaman ", 500, 100_000, 20_000, step=1000)
+suku_bunga = st.sidebar.number_input("Suku Bunga (%)", 6.0, 23.0, 15.0, step=0.5)
+
+# Derived ratios
+rasio_hutang = hutang / max(pendapatan, 1)
+rasio_pinjaman = jumlah_pinjaman / max(pendapatan, 1)
+rasio_pembayaran = (jumlah_pinjaman * suku_bunga / 100) / max(pendapatan, 1)
 
 st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Rasio Hutang / Pendapatan:** `{rasio_hutang:.3f}`")
+st.sidebar.markdown(f"**Rasio Pinjaman / Pendapatan:** `{rasio_pinjaman:.3f}`")
+st.sidebar.markdown(f"**Rasio Pembayaran / Pendapatan:** `{rasio_pembayaran:.3f}`")
+
 model_choice = st.sidebar.radio(
     "Model",
     AVAILABLE_MODELS + ["Bandingkan Keduanya"],
@@ -273,24 +207,28 @@ st.markdown(f"##### Prototype untuk staf kredit — model dimuat langsung dari `
 
 # Prepare input
 input_row = {
-    "durasi_pinjaman_bulan": durasi_pinjaman_bulan,
-    "jumlah_pinjaman": jumlah_pinjaman,
     "usia": usia,
-    "status_rekening": status_rekening,
-    "riwayat_kredit": riwayat_kredit,
-    "tujuan_pinjaman": tujuan_pinjaman,
+    "status_pekerjaan": status_pekerjaan,
+    "lama_bekerja_tahun": lama_bekerja,
+    "pendapatan_tahunan": pendapatan,
+    "skor_kredit": skor_kredit,
+    "lama_riwayat_kredit_tahun": lama_riwayat,
     "aset_tabungan": aset_tabungan,
-    "lama_bekerja": lama_bekerja,
-    "rasio_cicilan": rasio_cicilan,
-    "status_personal_dan_kelamin": status_personal_dan_kelamin,
-    "lama_tinggal": lama_tinggal,
-    "kepemilikan_harta": kepemilikan_harta,
-    "cicilan_lain": cicilan_lain,
-    "perumahan": perumahan,
-    "pekerjaan": pekerjaan
+    "hutang_saat_ini": hutang,
+    "tunggakan_2thn_terakhir": tunggakan,
+    "catatan_negatif": catatan_negatif,
+    "tipe_produk": tipe_produk,
+    "tujuan_pinjaman": tujuan,
+    "jumlah_pinjaman": jumlah_pinjaman,
+    "suku_bunga": suku_bunga,
+    "rasio_hutang_terhadap_pendapatan": rasio_hutang,
+    "rasio_pinjaman_terhadap_pendapatan": rasio_pinjaman,
+    "rasio_pembayaran_terhadap_pendapatan": rasio_pembayaran,
 }
 
 if predict_btn:
+    X_input = prepare_single_input(input_row, bundle)
+
     if model_choice == "Bandingkan Keduanya":
         models_to_run = [(name, bundle["models"][name]) for name in AVAILABLE_MODELS]
     else:
@@ -298,50 +236,42 @@ if predict_btn:
 
     cols = st.columns(len(models_to_run))
     for col, (mname, mdl) in zip(cols, models_to_run):
-        X_input = prepare_single_input(input_row, bundle, mname)
         pred = mdl.predict(X_input)[0]
         prob = mdl.predict_proba(X_input)[0]
         prob_gagal = prob[0]
         prob_lunas = prob[1]
 
-        label = "\u2705 LUNAS" if pred == 1 else "\u274c GAGAL BAYAR"
+        label = "✅ LUNAS" if pred == 1 else "❌ GAGAL BAYAR"
         css = "pred-lunas" if pred == 1 else "pred-gagal"
 
         with col:
             st.markdown(f"### {mname}")
-            color_hex = '#10b981' if pred == 1 else '#ef4444'
-            st.markdown(
-                f'<div class="pred-card {css}">'
-                f'<h2 style="margin:0;font-size:32px;color:{color_hex}">{label}</h2>'
-                f'<p style="margin-top:8px;font-size:15px;color:#94a3b8">'
-                f'Probabilitas Gagal Bayar: <b>{prob_gagal:.1%}</b> &nbsp;|&nbsp;'
-                f'Probabilitas Lunas: <b>{prob_lunas:.1%}</b></p></div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"""
+            <div class="pred-card {css}">
+                <h2 style="margin:0;font-size:32px;color:{'#10b981' if pred==1 else '#ef4444'}">{label}</h2>
+                <p style="margin-top:8px;font-size:15px;color:#94a3b8">
+                    Probabilitas Gagal Bayar: <b>{prob_gagal:.1%}</b> &nbsp;|&nbsp;
+                    Probabilitas Lunas: <b>{prob_lunas:.1%}</b>
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
 
-            # ── SHAP waterfall plot (penjelasan lokal per nasabah) ──
-            alasan = "disetujui" if pred == 1 else "ditolak"
-            st.markdown(
-                f'<div class="shap-section"><b>\U0001f50d Mengapa nasabah ini {alasan}?</b></div>',
-                unsafe_allow_html=True,
-            )
-            with st.spinner("Menghitung SHAP..."):
-                explainer = get_shap_explainer(mdl, mname)
-                fig = plot_shap_waterfall(explainer, X_input, mname, pred)
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
-            st.caption(
-                "\U0001f4cc Batang **merah** (kanan) = fitur yang **meningkatkan** probabilitas ke prediksi ini. "
-                "Batang **biru** (kiri) = fitur yang **menurunkan** probabilitas."
-            )
+            loss = jumlah_pinjaman * (1 - RECOVERY_RATE) * prob_gagal
+            st.markdown(f"""
+            <div class="metric-card" style="margin-top:16px">
+                <h3>💰 Estimasi Potensi Kerugian</h3>
+                <p> {loss:,.0f}</p>
+                <!-- <span style="font-size:12px;color:#94a3b8">= pinjaman × (1 − recovery) × P(gagal bayar)</span> -->
+            </div>
+            """, unsafe_allow_html=True)
 
     st.markdown("---")
 
     # ── Model performance metrics (dari hasil Nested CV di notebook) ─
-    st.markdown("## \U0001f4ca Performa Model")
+    st.markdown("## 📊 Performa Model")
     for mname in AVAILABLE_MODELS:
         m = bundle["metrics"][mname]
-        star = " \U0001f3c6" if mname == BEST_MODEL_NAME else ""
+        star = " 🏆" if mname == BEST_MODEL_NAME else ""
         st.markdown(f"#### {mname}{star}")
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         for col_w, (label, key) in zip(
@@ -350,14 +280,28 @@ if predict_btn:
              ("Recall", "recall"), ("F1-Score", "f1_score"),
              ("F2-Score", "f2_score"), ("AUC", "auc")],
         ):
-            col_w.markdown(
-                f'<div class="metric-card">'
-                f'<h3>{label}</h3>'
-                f'<p>{m["mean"][key]:.4f}</p>'
-                f'<span style="font-size:11px;color:#64748b">\u00b1{m["std"][key]:.4f}</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            col_w.markdown(f"""
+            <div class="metric-card">
+                <h3>{label}</h3>
+                <p>{m['mean'][key]:.4f}</p>
+                <span style="font-size:11px;color:#64748b">±{m['std'][key]:.4f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        fp_loss = m["total_fp"] * AVG_LOAN_AMOUNT * (1 - RECOVERY_RATE)
+        fn_cost = m["total_fn"] * AVG_LOAN_AMOUNT * PROFIT_MARGIN
+        st.markdown(f"""
+        <!--
+        <div class="metric-card" style="margin:12px 0 24px 0">
+            <h3>💸 Estimasi Kerugian Finansial </h3>
+            <p> {fp_loss + fn_cost:,.0f}</p>
+            <span style="font-size:12px;color:#94a3b8">
+                FP ({m['total_fp']:,}×) = {fp_loss:,.0f} &nbsp;|&nbsp;
+                FN ({m['total_fn']:,}×) = {fn_cost:,.0f}
+            </span>
+        </div>
+        -->
+        """, unsafe_allow_html=True)
 
     # ── Hyperparameter model final ──────────────────────────────────
     st.markdown("## 🔧 Hyperparameter Model Final")
@@ -376,23 +320,22 @@ if predict_btn:
 
 else:
     # Landing state
-    st.info("\U0001f448 Isi data nasabah di sidebar lalu klik **Prediksi Sekarang**")
+    st.info("👈 Isi data nasabah di sidebar lalu klik **Prediksi Sekarang**")
 
-    st.markdown("## \u2139\ufe0f Tentang Sistem")
+    st.markdown("## ℹ️ Tentang Sistem")
     c1, c2, c3 = st.columns(3)
     for col_w, icon, title, desc in [
-        (c1, "\U0001f332", "Random Forest", "Ensemble bagging dari banyak decision tree — model dari fold F2 terbaik"),
-        (c2, "\U0001f680", "XGBoost", "Gradient boosting yang dioptimasi untuk kecepatan — model dari fold F2 terbaik"),
-        (c3, "\U0001f52c", "SHAP Explanation", "Penjelasan transparan: fitur mana yang paling berpengaruh pada keputusan"),
+        (c1, "🌲", "Random Forest", "Ensemble bagging dari banyak decision tree"),
+        (c2, "🚀", "XGBoost", "Gradient boosting yang dioptimasi untuk kecepatan"),
+        (c3, "⚡", "Instan", "Kedua model sudah dilatih sebelumnya (model.pkl) — tidak ada training saat aplikasi dibuka"),
     ]:
-        col_w.markdown(
-            f'<div class="metric-card">'
-            f'<p style="font-size:36px;margin-bottom:4px">{icon}</p>'
-            f'<h3 style="font-size:16px !important">{title}</h3>'
-            f'<p style="font-size:13px;font-weight:400;color:#94a3b8">{desc}</p>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        col_w.markdown(f"""
+        <div class="metric-card">
+            <p style="font-size:36px;margin-bottom:4px">{icon}</p>
+            <h3 style="font-size:16px !important">{title}</h3>
+            <p style="font-size:13px;font-weight:400;color:#94a3b8">{desc}</p>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("### 📝 Fitur yang Digunakan")
@@ -400,18 +343,20 @@ else:
     | No | Fitur | Tipe |
     |---|---|---|
     | 1 | Usia | Numerik |
-    | 2 | Durasi Pinjaman (bulan) | Numerik |
-    | 3 | Jumlah Pinjaman | Numerik |
-    | 4 | Status Rekening | Kategorikal (One-Hot) |
-    | 5 | Riwayat Kredit | Kategorikal (One-Hot) |
-    | 6 | Tujuan Pinjaman | Kategorikal (One-Hot) |
-    | 7 | Aset Tabungan | Kategorikal (One-Hot) |
-    | 8 | Lama Bekerja | Kategorikal (One-Hot) |
-    | 9 | Rasio Cicilan | Kategorikal (One-Hot) |
-    | 10 | Status Personal & Kelamin | Kategorikal (One-Hot) |
-    | 11 | Lama Tinggal | Kategorikal (One-Hot) |
-    | 12 | Kepemilikan Harta | Kategorikal (One-Hot) |
-    | 13 | Cicilan Lain | Kategorikal (One-Hot) |
-    | 14 | Perumahan | Kategorikal (One-Hot) |
-    | 15 | Pekerjaan | Kategorikal (One-Hot) |
+    | 2 | Status Pekerjaan | Kategorikal (One-Hot) |
+    | 3 | Lama Bekerja (tahun) | Numerik |
+    | 4 | Pendapatan Tahunan | Numerik |
+    | 5 | Skor Kredit | Numerik |
+    | 6 | Lama Riwayat Kredit | Numerik |
+    | 7 | Aset / Tabungan | Numerik |
+    | 8 | Hutang Saat Ini | Numerik |
+    | 9 | Tunggakan 2 Tahun Terakhir | Numerik |
+    | 10 | Catatan Negatif | Numerik |
+    | 11 | Tipe Produk | Kategorikal (One-Hot) |
+    | 12 | Tujuan Pinjaman | Kategorikal (One-Hot) |
+    | 13 | Jumlah Pinjaman | Numerik |
+    | 14 | Suku Bunga | Numerik |
+    | 15 | Rasio Hutang / Pendapatan | Numerik |
+    | 16 | Rasio Pinjaman / Pendapatan | Numerik |
+    | 17 | Rasio Pembayaran / Pendapatan | Numerik |
     """)
